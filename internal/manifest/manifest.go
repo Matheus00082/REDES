@@ -26,16 +26,22 @@ type Manifest struct {
 
 // Create lê o arquivo e calcula o hash de cada bloco.
 func Create(path string, pieceSize int64) (*Manifest, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, err
+	if pieceSize <= 0 {
+		return nil, errors.New("tamanho do bloco deve ser maior que zero")
 	}
-	defer f.Close()
+
+	file, err := os.Open(path)
+
+	if err != nil {
+		return nil, fmt.Errorf("abrir arquivo: %w", err)
+	}
+
+	defer file.Close()
 
 	m := &Manifest{Name: filepath.Base(path), PieceSize: pieceSize}
 	buf := make([]byte, pieceSize)
 	for {
-		n, err := io.ReadFull(f, buf)
+		n, err := io.ReadFull(file, buf)
 		if n > 0 {
 			sum := sha256.Sum256(buf[:n])
 			m.Pieces = append(m.Pieces, hex.EncodeToString(sum[:]))
