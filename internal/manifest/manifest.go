@@ -11,6 +11,8 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+
+	"minitorrent/internal/wire"
 )
 
 // DefaultPieceSize é o tamanho padrão de bloco (256 KiB).
@@ -29,13 +31,15 @@ func Create(path string, pieceSize int64) (*Manifest, error) {
 	if pieceSize <= 0 {
 		return nil, errors.New("tamanho do bloco deve ser maior que zero")
 	}
+	if pieceSize > wire.MaxPieceSize {
+		return nil, fmt.Errorf("tamanho do bloco (%d bytes) excede o máximo suportado pelo protocolo (%d bytes)",
+			pieceSize, wire.MaxPieceSize)
+	}
 
 	file, err := os.Open(path)
-
 	if err != nil {
 		return nil, fmt.Errorf("abrir arquivo: %w", err)
 	}
-
 	defer file.Close()
 
 	m := &Manifest{Name: filepath.Base(path), PieceSize: pieceSize}
@@ -70,8 +74,21 @@ func Load(path string) (*Manifest, error) {
 	if err := json.Unmarshal(data, &m); err != nil {
 		return nil, fmt.Errorf("manifesto %s: %w", path, err)
 	}
-	if m.Size <= 0 || m.PieceSize <= 0 || int64(len(m.Pieces)) != (m.Size+m.PieceSize-1)/m.PieceSize {
+	if m.Size <= 0 || m.PieceSize <= 0 {
+		return nil, fmt.Errorf("manifesto %s inválido: size=%d, piece_size=%d", path, m.Size, m.PieceSize)
+	}
+	if m.PieceSize > wire.MaxPieceSize {
+		return nil, fmt.Errorf("manifesto %s: tamanho do bloco (%d bytes) excede o máximo suportado pelo protocolo (%d bytes)",
+			path, m.PieceSize, wire.MaxPieceSize)
+	}
+	if int64(len(m.Pieces)) != (m.Size+m.PieceSize-1)/m.PieceSize {
 		return nil, fmt.Errorf("manifesto %s incoerente: %d hashes para %d bytes", path, len(m.Pieces), m.Size)
+	}
+	for i, h := range m.Pieces {
+		raw, err := hex.DecodeString(h)
+		if err != nil || len(raw) != sha256.Size {
+			return nil, fmt.Errorf("manifesto %s: hash SHA-256 inválido no bloco %d", path, i)
+		}
 	}
 	return &m, nil
 }
@@ -90,6 +107,9 @@ func (m *Manifest) NumPieces() int { return len(m.Pieces) }
 
 // PieceLen devolve o tamanho do bloco i (o último pode ser menor).
 func (m *Manifest) PieceLen(i int) int64 {
+	if i < 0 || i >= len(m.Pieces) {
+		return 0
+	}
 	if i == len(m.Pieces)-1 {
 		return m.Size - int64(i)*m.PieceSize
 	}
@@ -98,6 +118,9 @@ func (m *Manifest) PieceLen(i int) int64 {
 
 // Verify diz se data é exatamente o bloco i (tamanho e SHA-256 certos).
 func (m *Manifest) Verify(i int, data []byte) bool {
+	if i < 0 || i >= len(m.Pieces) {
+		return false
+	}
 	if int64(len(data)) != m.PieceLen(i) {
 		return false
 	}

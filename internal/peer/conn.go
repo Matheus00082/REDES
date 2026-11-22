@@ -17,6 +17,13 @@ import (
 	"minitorrent/internal/wire"
 )
 
+const (
+	// Limites superiores para as filas por conexão, evitando crescimento linear
+	// ilimitado de memória em arquivos com dezenas de milhares de blocos.
+	maxOutQueue    = 4096
+	maxUploadQueue = 256
+)
+
 // Conn é a conexão TCP com um vizinho. Uma goroutine lê (readLoop) e outra
 // escreve (writeLoop). Quem quiser mandar algo usa send, que nunca bloqueia:
 // assim uma conexão lenta não trava o resto do nó.
@@ -24,15 +31,18 @@ type Conn struct {
 	n       *Node
 	id      string
 	nc      net.Conn
-	out     chan outMsg   // mensagens pequenas a enviar (BITFIELD, HAVE, REQUEST)
-	uploads chan int      // blocos que o vizinho pediu e ainda vamos enviar
-	closed  chan struct{} // fechado quando a conexão termina
+	ctx     context.Context    // cancelado quando a conexão é fechada (c.close)
+	cancel  context.CancelFunc // libera esperas do rate limiter imediatamente ao fechar
+	out     chan outMsg        // mensagens pequenas a enviar (BITFIELD, HAVE, REQUEST)
+	uploads chan int           // blocos que o vizinho pediu e ainda vamos enviar
+	closed  chan struct{}      // fechado quando a conexão termina
 	once    sync.Once
 
 	// protegidos por Node.mu
-	has     []bool // blocos que o vizinho tem
-	pending int    // pedidos nossos a ele ainda sem resposta
-	strikes int    // blocos corrompidos que ele nos mandou
+	has      []bool // blocos que o vizinho tem
+	pending  int    // pedidos nossos a ele ainda sem resposta
+	strikes  int    // blocos corrompidos que ele nos mandou
+	timeouts int    // timeouts consecutivos de pedidos sem resposta
 }
 
 type outMsg struct {
@@ -88,14 +98,16 @@ func (n *Node) acceptLoop(ln net.Listener) {
 // handshake até o fim.
 func (n *Node) handle(nc net.Conn, outgoing bool) {
 	defer nc.Close()
-	stopWatch := context.AfterFunc(n.ctx, func() { closeGracefully(nc) })
-	defer stopWatch()
 
+	// Durante o handshake, cancelar n.ctx fecha o socket imediatamente.
+	stopHandshakeWatch := context.AfterFunc(n.ctx, func() { nc.Close() })
 	if !outgoing && !n.shares() {
+		stopHandshakeWatch()
 		n.logf("recusando conexão de %s: no modo cliente-servidor o cliente só conversa com a semente", nc.RemoteAddr())
 		return
 	}
 	id, err := n.handshake(nc)
+	stopHandshakeWatch()
 	if err != nil {
 		if n.ctx.Err() == nil {
 			n.logf("handshake com %s falhou: %v", nc.RemoteAddr(), err)
@@ -105,10 +117,32 @@ func (n *Node) handle(nc net.Conn, outgoing bool) {
 
 	c := newConn(n, nc, id)
 	if err := n.register(c); err != nil {
+		c.close()
 		n.logf("recusando %s: %v", id, err)
 		return
 	}
 	n.logf("conectado a %s (%s)", id, nc.RemoteAddr())
+
+	// Após registrado, quem envia o FIN (CloseWrite) é a própria writeLoop ao
+	// concluir o quadro corrente, evitando truncar um bloco no meio do envio.
+	// Este timer garante o fechamento definitivo após closeGrace se o vizinho travar.
+	var (
+		graceMu    sync.Mutex
+		graceTimer *time.Timer
+	)
+	stopShutdownWatch := context.AfterFunc(n.ctx, func() {
+		graceMu.Lock()
+		graceTimer = time.AfterFunc(closeGrace, func() { c.close() })
+		graceMu.Unlock()
+	})
+	defer func() {
+		stopShutdownWatch()
+		graceMu.Lock()
+		if graceTimer != nil {
+			graceTimer.Stop()
+		}
+		graceMu.Unlock()
+	}()
 
 	n.wg.Add(1)
 	go c.writeLoop()
@@ -129,12 +163,27 @@ func (n *Node) handshake(nc net.Conn) (string, error) {
 
 func newConn(n *Node, nc net.Conn, id string) *Conn {
 	np := n.m.NumPieces()
+	outCap := np + 2*pipeline + 8
+	if outCap > maxOutQueue {
+		outCap = maxOutQueue
+	}
+	uploadCap := np
+	if uploadCap < 2*pipeline {
+		uploadCap = 2 * pipeline
+	}
+	if uploadCap > maxUploadQueue {
+		uploadCap = maxUploadQueue
+	}
+
+	connCtx, connCancel := context.WithCancel(context.Background())
 	return &Conn{
 		n:       n,
 		id:      id,
 		nc:      nc,
-		out:     make(chan outMsg, np+2*pipeline+8), // cabe um HAVE por bloco + os pedidos
-		uploads: make(chan int, np),
+		ctx:     connCtx,
+		cancel:  connCancel,
+		out:     make(chan outMsg, outCap),
+		uploads: make(chan int, uploadCap),
 		closed:  make(chan struct{}),
 		has:     make([]bool, np),
 	}
@@ -178,8 +227,8 @@ func (n *Node) unregister(c *Conn) {
 		}
 	}
 	released := 0
-	for i, owner := range n.inflight {
-		if owner == c {
+	for i, req := range n.inflight {
+		if req.conn == c {
 			delete(n.inflight, i)
 			released++
 		}
@@ -192,23 +241,21 @@ func (n *Node) unregister(c *Conn) {
 
 func (c *Conn) close() {
 	c.once.Do(func() {
+		c.cancel()
 		close(c.closed)
 		c.nc.Close()
 	})
 }
 
-// closeGracefully é usado quando o nó sai da rede. Fechar o socket de uma vez
-// faria o kernel responder com RST aos dados que ainda chegam, e o vizinho
-// perderia os blocos que já estavam a caminho. Em vez disso, CloseWrite manda
-// o FIN depois de tudo o que já está no buffer; o readLoop continua lendo até
-// o vizinho fechar o lado dele, e após closeGrace fechamos de qualquer jeito.
-func closeGracefully(nc net.Conn) {
+// closeWriteGracefully envia apenas o FIN (CloseWrite) após a writeLoop
+// concluir o último quadro, permitindo que o vizinho receba todos os bytes
+// já colocados no socket sem receber RST.
+func closeWriteGracefully(nc net.Conn) {
 	if tc, ok := nc.(*net.TCPConn); ok {
-		tc.CloseWrite()
-		time.AfterFunc(closeGrace, func() { nc.Close() })
+		_ = tc.CloseWrite()
 		return
 	}
-	nc.Close()
+	_ = nc.Close()
 }
 
 // --- escrita ---
@@ -225,23 +272,34 @@ func (c *Conn) send(typ uint8, payload []byte) {
 }
 
 // writeLoop é a única goroutine que escreve no socket depois do handshake.
-// Se o nó está saindo, só para de escrever: quem fecha a conexão é o
-// closeGracefully, depois que o vizinho recebeu tudo.
+// Quando n.ctx é cancelado, encerra entre quadros (sem truncar dados) e envia
+// FIN via closeWriteGracefully.
 func (c *Conn) writeLoop() {
 	defer c.n.wg.Done()
 	keepAlive := time.NewTicker(keepAliveEvery)
 	defer keepAlive.Stop()
+
+	pieceWriter := io.Writer(c.nc)
+	if c.n.upLimiter != nil {
+		pieceWriter = c.n.upLimiter.LimitWriterContext(c.ctx, c.nc)
+	}
+
 	for {
+		if c.n.ctx.Err() != nil {
+			closeWriteGracefully(c.nc)
+			return
+		}
 		var err error
 		select {
 		case <-c.closed:
 			return
 		case <-c.n.ctx.Done():
+			closeWriteGracefully(c.nc)
 			return
 		case m := <-c.out:
 			err = wire.WriteFrame(c.nc, m.typ, m.payload)
 		case i := <-c.uploads:
-			err = c.sendPiece(i)
+			err = c.sendPiece(pieceWriter, i)
 		case <-keepAlive.C:
 			err = wire.WriteKeepAlive(c.nc)
 		}
@@ -254,24 +312,26 @@ func (c *Conn) writeLoop() {
 	}
 }
 
-// sendPiece lê o bloco i do disco e o envia. Com -corrupt, estraga o bloco
-// antes de mandar (é assim que simulamos um par malicioso).
-func (c *Conn) sendPiece(i int) error {
+// sendPiece lê o bloco i do disco e o envia (respeitando upLimiter, se ativo).
+// Com -corrupt, estraga o bloco antes de mandar (simula um par malicioso).
+func (c *Conn) sendPiece(w io.Writer, i int) error {
 	n := c.n
 	data, err := n.store.ReadPiece(i)
 	if err != nil {
 		return err
 	}
-	if n.cfg.Corrupt > 0 && rand.Float64() < n.cfg.Corrupt {
+	if len(data) > 0 && n.cfg.Corrupt > 0 && rand.Float64() < n.cfg.Corrupt {
 		data[0] ^= 0xFF
 	}
-	if err := wire.WritePiece(c.nc, uint32(i), data); err != nil {
+	if err := wire.WritePiece(w, uint32(i), data); err != nil {
 		return err
 	}
 	total := n.uploaded.Add(int64(len(data)))
 	if n.cfg.LeaveAfter > 0 && total >= n.cfg.LeaveAfter {
-		n.logf("já enviei %s: saindo da rede (-leave-after)", mb(total))
-		n.stop()
+		n.leaveOnce.Do(func() {
+			n.logf("já enviei %s: saindo da rede (-leave-after)", mb(total))
+			n.stop()
+		})
 	}
 	return nil
 }
@@ -281,7 +341,11 @@ func (c *Conn) sendPiece(i int) error {
 // readLoop lê mensagens até a conexão cair ou o vizinho violar o protocolo.
 // Se nada chegar em deadAfter (nem keep-alive), o vizinho é dado como morto.
 func (c *Conn) readLoop() error {
-	r := bufio.NewReaderSize(c.nc, 64<<10)
+	src := io.Reader(c.nc)
+	if c.n.downLimiter != nil {
+		src = c.n.downLimiter.LimitReaderContext(c.ctx, c.nc)
+	}
+	r := bufio.NewReaderSize(src, 64<<10)
 	for {
 		c.nc.SetReadDeadline(time.Now().Add(deadAfter))
 		f, err := wire.ReadFrame(r)
@@ -366,7 +430,7 @@ func describe(err error) string {
 		return "o vizinho fechou a conexão"
 	case errors.As(err, &ne) && ne.Timeout():
 		return fmt.Sprintf("nada recebido em %v (heartbeat perdido)", deadAfter)
-	case errors.Is(err, net.ErrClosed):
+	case errors.Is(err, net.ErrClosed), errors.Is(err, context.Canceled):
 		return "conexão fechada por nós"
 	default:
 		return err.Error()

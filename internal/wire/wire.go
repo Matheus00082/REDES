@@ -16,6 +16,10 @@ const (
 
 	// MaxFrameSize evita que um quadro peça alocação gigante de memória.
 	MaxFrameSize uint32 = 16 * 1024 * 1024
+
+	// MaxPieceSize é o maior bloco que cabe em um quadro MsgPiece
+	// (MaxFrameSize menos 1 byte de tipo e 4 bytes do índice do bloco).
+	MaxPieceSize int64 = int64(MaxFrameSize) - 5
 )
 
 // Frame representa uma mensagem decodificada do protocolo sobre TCP.
@@ -26,14 +30,13 @@ type Frame struct {
 
 // WriteFrame escreve [len uint32 (1 + len(payload))][type uint8][payload] em um quadro binário (w).
 func WriteFrame(w io.Writer, msgType uint8, payload []byte) error {
-	totalLen := uint32(1 + len(payload))
-
-	if totalLen > MaxFrameSize {
-		return fmt.Errorf("quadro muito grande: %d bytes", totalLen)
+	totalLen64 := int64(1) + int64(len(payload))
+	if totalLen64 > int64(MaxFrameSize) {
+		return fmt.Errorf("quadro muito grande: %d bytes (máximo %d)", totalLen64, MaxFrameSize)
 	}
 
 	var hdr [5]byte
-	binary.BigEndian.PutUint32(hdr[:4], totalLen)
+	binary.BigEndian.PutUint32(hdr[:4], uint32(totalLen64))
 	hdr[4] = msgType
 
 	if _, err := w.Write(hdr[:]); err != nil {
@@ -163,8 +166,11 @@ func SetBit(bf []byte, idx int, val bool) error {
 
 // Handshake troca e valida infohash e peerID sobre uma conexão io.ReadWriter.
 func Handshake(rw io.ReadWriter, localInfoHash, localPeerID string) (remotePeerID string, err error) {
-	if len(localPeerID) > 65535 {
-		return "", errors.New("peerID longo demais")
+	if len(localInfoHash) == 0 || len(localInfoHash) > 4096 {
+		return "", errors.New("infohash local inválido")
+	}
+	if len(localPeerID) == 0 || len(localPeerID) > 65535 {
+		return "", errors.New("peerID local inválido")
 	}
 
 	// Formato simples: [len(infohash) uint16][infohash][len(peerID) uint16][peerID]

@@ -12,12 +12,15 @@ import (
 	"time"
 )
 
+const maxAnnounceBodyBytes = 64 << 10 // 64 KiB
+
 // PeerInfo representa um peer anunciado no enxame de um infohash.
 type PeerInfo struct {
-	ID       string `json:"id"`
-	Addr     string `json:"addr"`
-	Seed     bool   `json:"seed"`
-	LastSeen time.Time
+	ID       string    `json:"id"`
+	Addr     string    `json:"addr"`
+	Seed     bool      `json:"seed"`
+	Mode     string    `json:"mode,omitempty"`
+	LastSeen time.Time `json:"last_seen"`
 }
 
 // AnnounceRequest é o payload enviado pelo peer ao tracker.
@@ -26,13 +29,15 @@ type AnnounceRequest struct {
 	ID       string `json:"id"`
 	Addr     string `json:"addr"`
 	Seed     bool   `json:"seed"`
+	Mode     string `json:"mode,omitempty"`  // "", "p2p", "cs"
 	Event    string `json:"event,omitempty"` // "", "started", "stopped"
 }
 
 // AnnounceResponse é o que o tracker devolve ao peer.
 type AnnounceResponse struct {
-	Interval time.Duration `json:"interval"`
-	Peers    []PeerInfo    `json:"peers"`
+	Interval   time.Duration `json:"interval"`
+	IntervalMs int64         `json:"interval_ms"`
+	Peers      []PeerInfo    `json:"peers"`
 }
 
 // Server mantém os enxames ativos em memória e expõe endpoints HTTP.
@@ -111,6 +116,7 @@ func (s *Server) Announce(req AnnounceRequest) ([]PeerInfo, error) {
 		ID:       req.ID,
 		Addr:     req.Addr,
 		Seed:     req.Seed,
+		Mode:     req.Mode,
 		LastSeen: now,
 	}
 
@@ -148,6 +154,7 @@ func (s *Server) handleAnnounce(w http.ResponseWriter, r *http.Request) {
 
 	var req AnnounceRequest
 	if r.Method == http.MethodPost {
+		r.Body = http.MaxBytesReader(w, r.Body, maxAnnounceBodyBytes)
 		defer r.Body.Close()
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			http.Error(w, "JSON inválido", http.StatusBadRequest)
@@ -160,6 +167,7 @@ func (s *Server) handleAnnounce(w http.ResponseWriter, r *http.Request) {
 			ID:       q.Get("id"),
 			Addr:     q.Get("addr"),
 			Seed:     q.Get("seed") == "1" || q.Get("seed") == "true",
+			Mode:     q.Get("mode"),
 			Event:    q.Get("event"),
 		}
 	}
@@ -172,8 +180,9 @@ func (s *Server) handleAnnounce(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(AnnounceResponse{
-		Interval: s.interval,
-		Peers:    peers,
+		Interval:   s.interval,
+		IntervalMs: s.interval.Milliseconds(),
+		Peers:      peers,
 	})
 }
 
@@ -197,7 +206,13 @@ func (s *Server) Run(ctx context.Context, addr string) error {
 		return fmt.Errorf("escutar em %s: %w", addr, err)
 	}
 
-	srv := &http.Server{Handler: mux}
+	srv := &http.Server{
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      10 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
 
 	errCh := make(chan error, 1)
 	go func() {

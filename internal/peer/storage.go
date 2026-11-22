@@ -29,7 +29,7 @@ func OpenStorage(path string, m *manifest.Manifest, readOnly bool) (*Storage, er
 	if m == nil {
 		return nil, errors.New("manifesto não pode ser nulo")
 	}
-	if m.PieceSize <= 0 || m.Size < 0 {
+	if m.PieceSize <= 0 || m.Size <= 0 || m.NumPieces() == 0 {
 		return nil, errors.New("manifesto com tamanho ou piece_size inválido")
 	}
 
@@ -43,7 +43,13 @@ func OpenStorage(path string, m *manifest.Manifest, readOnly bool) (*Storage, er
 		return nil, fmt.Errorf("abrir arquivo de dados %q: %w", path, err)
 	}
 
+	shouldScan := readOnly
 	if !readOnly {
+		// Só escaneia blocos se o arquivo já existia com conteúdo (evita calcular
+		// SHA-256 de todo um arquivo recém-criado e preenchido com zeros).
+		if fi, statErr := f.Stat(); statErr == nil && fi.Size() > 0 {
+			shouldScan = true
+		}
 		// Garante que o arquivo tenha o tamanho final esperado (útil para gravações em qualquer offset).
 		if err := f.Truncate(m.Size); err != nil {
 			_ = f.Close()
@@ -57,9 +63,11 @@ func OpenStorage(path string, m *manifest.Manifest, readOnly bool) (*Storage, er
 		have:     make([]bool, m.NumPieces()),
 	}
 
-	if err := s.scanExisting(); err != nil {
-		_ = f.Close()
-		return nil, err
+	if shouldScan {
+		if err := s.scanExisting(); err != nil {
+			_ = f.Close()
+			return nil, err
+		}
 	}
 
 	return s, nil
@@ -71,12 +79,7 @@ func (s *Storage) PieceSizeAt(index int) (int, error) {
 	if index < 0 || index >= n {
 		return 0, fmt.Errorf("índice de bloco fora do intervalo: %d", index)
 	}
-	offset := int64(index) * s.manifest.PieceSize
-	rem := s.manifest.Size - offset
-	if rem < s.manifest.PieceSize {
-		return int(rem), nil
-	}
-	return int(s.manifest.PieceSize), nil
+	return int(s.manifest.PieceLen(index)), nil
 }
 
 // scanExisting verifica quais blocos no arquivo já batem com o hash do manifesto.
@@ -95,7 +98,7 @@ func (s *Storage) scanExisting() error {
 		offset := int64(i) * s.manifest.PieceSize
 		_, err = s.file.ReadAt(buf, offset)
 		if err != nil {
-			// Arquivo novo ou menor que o offset ainda não tem o bloco válido.
+			// Arquivo menor que o offset ainda não tem o bloco válido.
 			continue
 		}
 		if s.manifest.Verify(i, buf) {
@@ -143,7 +146,23 @@ func (s *Storage) WritePiece(index int, data []byte) (bool, error) {
 	if !s.manifest.Verify(index, data) {
 		return false, fmt.Errorf("hash SHA-256 inválido para bloco %d", index)
 	}
+	return s.writePieceData(index, data)
+}
 
+// WriteVerifiedPiece grava um bloco cujo SHA-256 já foi validado pelo chamador,
+// evitando recalcular o hash durante o fluxo de download.
+func (s *Storage) WriteVerifiedPiece(index int, data []byte) (bool, error) {
+	sz, err := s.PieceSizeAt(index)
+	if err != nil {
+		return false, err
+	}
+	if len(data) != sz {
+		return false, fmt.Errorf("tamanho inválido para bloco %d: esperava %d, recebeu %d", index, sz, len(data))
+	}
+	return s.writePieceData(index, data)
+}
+
+func (s *Storage) writePieceData(index int, data []byte) (bool, error) {
 	offset := int64(index) * s.manifest.PieceSize
 	if _, err := s.file.WriteAt(data, offset); err != nil {
 		return false, fmt.Errorf("gravar bloco %d no disco: %w", index, err)
@@ -182,7 +201,7 @@ func (s *Storage) IsComplete() bool {
 	return total > 0 && have == total
 }
 
-// BitfieldBytes retorna uma cópia do vetor de bits representando os blocos que o nó possui.
+// HaveSlice retorna uma cópia do slice booleano representando os blocos que o nó possui.
 func (s *Storage) HaveSlice() []bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()

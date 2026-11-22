@@ -9,6 +9,9 @@ import (
 	"time"
 )
 
+// ErrInvalidWaitArgs indica chamada inválida ao helper variádico Wait/WaitN.
+var ErrInvalidWaitArgs = errors.New("argumentos inválidos para Wait (use Wait(n) ou Wait(ctx, n))")
+
 // Limiter limita o volume de dados transferidos em bytes por segundo.
 //
 // O limite usa um token bucket: uma rajada inicial de até burst bytes é
@@ -24,8 +27,8 @@ type Limiter struct {
 }
 
 // New cria um limitador com a taxa informada em bytes por segundo.
-// O argumento opcional burst define o tamanho da rajada; por padrão, uma
-// segunda de transferência cabe no bucket.
+// O argumento opcional burst define o tamanho da rajada; por padrão, um
+// segundo de transferência cabe no bucket.
 func New(bytesPerSecond int64, burst ...int64) *Limiter {
 	rate := bytesPerSecond
 	burstSize := rate
@@ -129,6 +132,28 @@ func (l *Limiter) BytesPerSecond() int64 {
 	return int64(l.rate)
 }
 
+// maxChunk retorna o tamanho máximo de um bloco unitário (burst) quando o
+// limitador está ativo, ou 0 se estiver ilimitado.
+func (l *Limiter) maxChunk() int {
+	if l == nil {
+		return 0
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.rate <= 0 || l.burst <= 0 {
+		return 0
+	}
+	maxInt := int(^uint(0) >> 1)
+	if l.burst >= float64(maxInt) {
+		return maxInt
+	}
+	chunk := int(l.burst)
+	if chunk < 1 {
+		return 1
+	}
+	return chunk
+}
+
 func (l *Limiter) refillLocked(now time.Time) {
 	if l.rate <= 0 {
 		l.last = now
@@ -171,7 +196,7 @@ func (l *Limiter) AllowN(n int) bool {
 	return l.Allow(int64(n))
 }
 
-// WaitContext bloqueia até que n bytes possam ser enviados ou o contexto seja cancelado.
+// WaitContext bloqueia até que n bytes possam ser transferidos ou o contexto seja cancelado.
 func (l *Limiter) WaitContext(ctx context.Context, n int) error {
 	if ctx == nil {
 		ctx = context.Background()
@@ -202,6 +227,9 @@ func (l *Limiter) WaitContext(ctx context.Context, n int) error {
 		chunk := remaining
 		if float64(chunk) > l.burst {
 			chunk = int64(l.burst)
+		}
+		if chunk < 1 {
+			chunk = 1
 		}
 
 		needed := float64(chunk)
@@ -279,28 +307,43 @@ func (l *Limiter) refund(n int64) {
 	}
 }
 
-// Wait aceita Wait(n) ou Wait(ctx, n). A forma flexível evita ambiguidade
-// entre os estilos de uso comuns.
+func parseByteCount(v any) (int, bool) {
+	switch n := v.(type) {
+	case int:
+		return n, true
+	case int64:
+		return int(n), true
+	default:
+		return 0, false
+	}
+}
+
+// Wait aceita Wait(n) ou Wait(ctx, n). Retorna ErrInvalidWaitArgs se os
+// argumentos forem inválidos.
 func (l *Limiter) Wait(args ...any) error {
 	switch len(args) {
 	case 1:
-		n, ok := args[0].(int)
+		n, ok := parseByteCount(args[0])
 		if !ok {
-			return context.DeadlineExceeded
+			return ErrInvalidWaitArgs
 		}
 		return l.WaitContext(context.Background(), n)
 	case 2:
-		ctx, ok := args[0].(context.Context)
-		if !ok {
-			return context.DeadlineExceeded
+		var ctx context.Context
+		if args[0] != nil {
+			var ok bool
+			ctx, ok = args[0].(context.Context)
+			if !ok {
+				return ErrInvalidWaitArgs
+			}
 		}
-		n, ok := args[1].(int)
+		n, ok := parseByteCount(args[1])
 		if !ok {
-			return context.DeadlineExceeded
+			return ErrInvalidWaitArgs
 		}
 		return l.WaitContext(ctx, n)
 	default:
-		return context.DeadlineExceeded
+		return ErrInvalidWaitArgs
 	}
 }
 
@@ -309,13 +352,15 @@ func (l *Limiter) WaitN(args ...any) error {
 	return l.Wait(args...)
 }
 
-// LimitedReader aplica o limite antes das leituras.
+// LimitedReader aplica o limite de taxa de forma exata aos bytes lidos.
 type LimitedReader struct {
 	r       io.Reader
 	limiter *Limiter
 	ctx     context.Context
 }
 
+// Read lê até o limite do burst atual e consome exatamente os n bytes lidos,
+// evitando desperdício de tokens em leituras menores que len(p).
 func (lr *LimitedReader) Read(p []byte) (int, error) {
 	if lr == nil || lr.r == nil {
 		return 0, io.EOF
@@ -327,22 +372,43 @@ func (lr *LimitedReader) Read(p []byte) (int, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if err := lr.limiter.WaitContext(ctx, len(p)); err != nil {
+	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
 
-	n, err := lr.r.Read(p)
-	if n < 0 || n > len(p) {
-		lr.limiter.refund(int64(len(p)))
+	buf := p
+	if lr.limiter != nil {
+		if burst := lr.limiter.maxChunk(); burst > 0 && len(buf) > burst {
+			buf = buf[:burst]
+		}
+	}
+
+	n, err := lr.r.Read(buf)
+	if n < 0 || n > len(buf) {
 		return 0, errors.New("reader returned an invalid byte count")
 	}
-	lr.limiter.refund(int64(len(p) - n))
+	if n > 0 && lr.limiter != nil {
+		if waitErr := lr.limiter.WaitContext(ctx, n); waitErr != nil {
+			return n, waitErr
+		}
+	}
 	return n, err
 }
 
-// LimitReader envolve r com este limitador.
+// LimitReader envolve r com este limitador usando context.Background().
 func (l *Limiter) LimitReader(r io.Reader) io.Reader {
-	return &LimitedReader{r: r, limiter: l, ctx: context.Background()}
+	return l.LimitReaderContext(context.Background(), r)
+}
+
+// LimitReaderContext envolve r com este limitador respeitando o cancelamento de ctx.
+func (l *Limiter) LimitReaderContext(ctx context.Context, r io.Reader) io.Reader {
+	if l == nil {
+		return r
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return &LimitedReader{r: r, limiter: l, ctx: ctx}
 }
 
 // Reader é um alias conveniente de LimitReader.
@@ -350,7 +416,7 @@ func (l *Limiter) Reader(r io.Reader) io.Reader {
 	return l.LimitReader(r)
 }
 
-// LimitedWriter aplica o limite antes das escritas.
+// LimitedWriter aplica o limite em fatias compatíveis com o burst antes de escrever.
 type LimitedWriter struct {
 	w       io.Writer
 	limiter *Limiter
@@ -368,22 +434,53 @@ func (lw *LimitedWriter) Write(p []byte) (int, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if err := lw.limiter.WaitContext(ctx, len(p)); err != nil {
-		return 0, err
+	if lw.limiter == nil {
+		return lw.w.Write(p)
 	}
 
-	n, err := lw.w.Write(p)
-	if n < 0 || n > len(p) {
-		lw.limiter.refund(int64(len(p)))
-		return 0, errors.New("writer returned an invalid byte count")
+	written := 0
+	for written < len(p) {
+		chunkLen := len(p) - written
+		if burst := lw.limiter.maxChunk(); burst > 0 && chunkLen > burst {
+			chunkLen = burst
+		}
+		if err := lw.limiter.WaitContext(ctx, chunkLen); err != nil {
+			return written, err
+		}
+
+		n, err := lw.w.Write(p[written : written+chunkLen])
+		if n < 0 || n > chunkLen {
+			lw.limiter.refund(int64(chunkLen))
+			return written, errors.New("writer returned an invalid byte count")
+		}
+		if n < chunkLen {
+			lw.limiter.refund(int64(chunkLen - n))
+		}
+		written += n
+		if err != nil {
+			return written, err
+		}
+		if n == 0 {
+			return written, io.ErrShortWrite
+		}
 	}
-	lw.limiter.refund(int64(len(p) - n))
-	return n, err
+	return written, nil
 }
 
-// LimitWriter envolve w com este limitador.
+// LimitWriter envolve w com este limitador usando context.Background().
 func (l *Limiter) LimitWriter(w io.Writer) io.Writer {
-	return &LimitedWriter{w: w, limiter: l, ctx: context.Background()}
+	return l.LimitWriterContext(context.Background(), w)
+}
+
+// LimitWriterContext envolve w com este limitador respeitando o cancelamento de ctx.
+func (l *Limiter) LimitWriterContext(ctx context.Context, w io.Writer) io.Writer {
+	if l == nil {
+		return w
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return &LimitedWriter{w: w, limiter: l, ctx: ctx}
 }
 
 // Writer é um alias conveniente de LimitWriter.

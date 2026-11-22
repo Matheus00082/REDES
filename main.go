@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"math"
 	"os"
 	"os/signal"
 	"syscall"
@@ -14,6 +15,7 @@ import (
 	"minitorrent/internal/manifest"
 	"minitorrent/internal/peer"
 	"minitorrent/internal/tracker"
+	"minitorrent/internal/wire"
 )
 
 const usage = `uso: minitorrent <comando> [opções]
@@ -70,6 +72,9 @@ func runManifest(args []string) error {
 		fs.Usage()
 		return errors.New("-in é obrigatório")
 	}
+	if *piece <= 0 || *piece > wire.MaxPieceSize {
+		return fmt.Errorf("-piece deve estar entre 1 e %d bytes", wire.MaxPieceSize)
+	}
 	if *out == "" {
 		*out = *in + ".manifest.json"
 	}
@@ -116,13 +121,16 @@ func runPeer(ctx context.Context, args []string, seed bool) error {
 	}
 	fs.StringVar(&cfg.ID, "id", "", "nome do peer nos logs e no tracker (padrão: aleatório)")
 	fs.StringVar(&cfg.TrackerURL, "tracker", "http://127.0.0.1:8000", "URL do tracker")
-	fs.StringVar(&cfg.ListenAddr, "listen", "127.0.0.1:0", "ip:porta para aceitar conexões (o ip é anunciado ao tracker)")
-	fs.Float64Var(&cfg.Corrupt, "corrupt", 0, "probabilidade de corromper cada bloco enviado (simula par malicioso)")
+	fs.StringVar(&cfg.ListenAddr, "listen", "127.0.0.1:0", "ip:porta para aceitar conexões (o ip é anunciado ao tracker se -advertise não for informado)")
+	fs.StringVar(&cfg.AdvertiseAddr, "advertise", "", "ip:porta anunciado ao tracker (útil quando -listen usa 0.0.0.0 ou :porta)")
+	fs.Float64Var(&cfg.Corrupt, "corrupt", 0, "probabilidade [0, 1] de corromper cada bloco enviado (simula par malicioso)")
+	fs.Int64Var(&cfg.UpLimit, "up-limit", 0, "limite global de upload em bytes/s (0 = ilimitado)")
 	leaveAfter := fs.Float64("leave-after", 0, "sair depois de enviar X vezes o tamanho do arquivo (0 = nunca)")
 	if !seed {
 		fs.StringVar(&cfg.Mode, "mode", peer.ModeP2P, "p2p, ou cs (cliente-servidor: só baixa da semente e não repassa nada)")
 		fs.StringVar(&cfg.Picker, "picker", peer.PickRarest, "política de blocos: rarest ou sequential")
 		fs.BoolVar(&cfg.Linger, "linger", false, "continuar semeando depois de completar o download")
+		fs.Int64Var(&cfg.DownLimit, "down-limit", 0, "limite global de download em bytes/s (0 = ilimitado)")
 		fs.StringVar(&cfg.ResultPath, "result", "", "arquivo JSON com as estatísticas do download")
 	}
 	if err := fs.Parse(args); err != nil {
@@ -131,6 +139,18 @@ func runPeer(ctx context.Context, args []string, seed bool) error {
 	if *manifestPath == "" || cfg.DataPath == "" {
 		fs.Usage()
 		return errors.New("-manifest e o arquivo de dados são obrigatórios")
+	}
+	if math.IsNaN(cfg.Corrupt) || math.IsInf(cfg.Corrupt, 0) || cfg.Corrupt < 0 || cfg.Corrupt > 1 {
+		return fmt.Errorf("-corrupt deve estar entre 0 e 1 (recebido %v)", cfg.Corrupt)
+	}
+	if math.IsNaN(*leaveAfter) || math.IsInf(*leaveAfter, 0) || *leaveAfter < 0 {
+		return fmt.Errorf("-leave-after não pode ser negativo (recebido %v)", *leaveAfter)
+	}
+	if cfg.UpLimit < 0 {
+		return fmt.Errorf("-up-limit não pode ser negativo (recebido %d)", cfg.UpLimit)
+	}
+	if cfg.DownLimit < 0 {
+		return fmt.Errorf("-down-limit não pode ser negativo (recebido %d)", cfg.DownLimit)
 	}
 
 	m, err := manifest.Load(*manifestPath)
