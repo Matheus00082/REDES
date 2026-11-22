@@ -1,3 +1,5 @@
+//	storage.go   leitura e escrita dos blocos no disco
+
 package peer
 
 import (

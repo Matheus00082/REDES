@@ -70,8 +70,30 @@ func TestFramesAndBitfield(t *testing.T) {
 	}
 }
 
+// tcpPair devolve as duas pontas de uma conexão TCP de verdade em 127.0.0.1.
+// net.Pipe não serve para testar o handshake: ele não tem buffer, e como os
+// dois lados escrevem antes de ler, os dois ficariam travados no Write.
+func tcpPair(t *testing.T) (net.Conn, net.Conn) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	c1, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	c2, err := ln.Accept()
+	if err != nil {
+		c1.Close()
+		t.Fatal(err)
+	}
+	return c1, c2
+}
+
 func TestHandshake(t *testing.T) {
-	c1, c2 := net.Pipe()
+	c1, c2 := tcpPair(t)
 	defer c1.Close()
 	defer c2.Close()
 
