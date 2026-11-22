@@ -43,6 +43,8 @@ type Conn struct {
 	pending  int    // pedidos nossos a ele ainda sem resposta
 	strikes  int    // blocos corrompidos que ele nos mandou
 	timeouts int    // timeouts consecutivos de pedidos sem resposta
+	// quando ele nos entregou o último bloco válido
+	lastPiece time.Time
 }
 
 type outMsg struct {

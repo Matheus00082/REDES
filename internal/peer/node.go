@@ -42,6 +42,7 @@ const (
 	keepAliveEvery     = 5 * time.Second  // heartbeat entre vizinhos
 	deadAfter          = 30 * time.Second // nada recebido nesse tempo = vizinho morto
 	requestTimeout     = 15 * time.Second // prazo para um pedido de bloco ser atendido
+	maxRequestWait     = 60 * time.Second // prazo máximo, mesmo se o vizinho continuar entregando outros blocos
 	inflightCheckEvery = 2 * time.Second  // frequência de verificação de pedidos expirados
 	dialTimeout        = 3 * time.Second
 	handshakeTimeout   = 5 * time.Second

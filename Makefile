@@ -17,30 +17,35 @@ SIZE_MB      ?= 16
 PEERS        ?= 4
 UP_LIMIT     ?= 2097152
 LEAVE_AFTER  ?= 1.2
+PICKER_LEAVE ?= 1
+PICKER_WAIT  ?= 10
+REPS         ?= 3
 TRACKER_ADDR ?= 127.0.0.1:8000
 TRACKER_URL  ?= http://$(TRACKER_ADDR)
 TIMEOUT_SEC  ?= 180
 
-.PHONY: help build prepare demo demo-cs demo-p2p report compare demo-corrupt demo-leave swarms clean
+.PHONY: help build prepare demo demo-cs demo-p2p report compare demo-corrupt demo-leave demo-picker swarms clean
 
 help:
 	@printf '%s\n' \
 		"MiniTorrent - Comandos disponíveis:" \
 		"" \
 		"  make demo          Executa toda a demonstração (build, CS vs P2P, malicioso e saída da semente)" \
-		"  make compare       Executa CS e P2P com a mesma banda na semente e imprime o comparativo" \
+		"  make compare       Executa CS e P2P com o mesmo limite de upload em todos os nós e imprime o comparativo" \
 		"  make report        Exibe a tabela comparativa dos últimos resultados salvos em $(DEMO_DIR)/" \
 		"  make demo-cs       Executa apenas o cenário Cliente-Servidor (-mode cs)" \
 		"  make demo-p2p      Executa apenas o cenário P2P com rarest-first (-mode p2p)" \
 		"  make demo-corrupt  Demonstra detecção SHA-256 e banimento automático de peer malicioso" \
 		"  make demo-leave    Demonstra sobrevivência do enxame após saída precoce da semente (-leave-after)" \
+		"  make demo-picker   Compara rarest-first e sequencial: quanto do arquivo sobra quando a semente sai" \
 		"  make build         Roda go vet e compila $(BIN) com detector de race (-race)" \
 		"  make prepare       Gera arquivo aleatório ($(SIZE_MB) MiB) e manifesto SHA-256" \
 		"  make swarms        Consulta os enxames ativos no tracker em $(TRACKER_URL)/swarms" \
 		"  make clean         Remove $(DEMO_DIR)/ e o binário $(BIN)" \
 		"" \
 		"Parâmetros configuráveis (valores atuais):" \
-		"  SIZE_MB=$(SIZE_MB)  PEERS=$(PEERS)  UP_LIMIT=$(UP_LIMIT) B/s  LEAVE_AFTER=$(LEAVE_AFTER)  TRACKER_ADDR=$(TRACKER_ADDR)"
+		"  SIZE_MB=$(SIZE_MB)  PEERS=$(PEERS)  UP_LIMIT=$(UP_LIMIT) B/s  LEAVE_AFTER=$(LEAVE_AFTER)  TRACKER_ADDR=$(TRACKER_ADDR)" \
+		"  PICKER_LEAVE=$(PICKER_LEAVE)  PICKER_WAIT=$(PICKER_WAIT) s  REPS=$(REPS)"
 
 build:
 	@set -euo pipefail
@@ -199,7 +204,7 @@ demo-p2p: prepare
 	for i in $$(seq 1 "$(PEERS)"); do
 		"$(BIN)" get -id "p2p-$$i" -manifest "$(MANIFEST)" \
 			-out "$(DEMO_DIR)/p2p-$$i.bin" -tracker "$(TRACKER_URL)" \
-			-mode p2p -picker rarest -linger -result "$(DEMO_DIR)/p2p-$$i.json" \
+			-mode p2p -picker rarest -up-limit "$(UP_LIMIT)" -linger -result "$(DEMO_DIR)/p2p-$$i.json" \
 			>"$(DEMO_DIR)/p2p-$$i.log" 2>&1 &
 		pid=$$!
 		PEER_PIDS+=("$$pid")
@@ -528,6 +533,92 @@ demo-leave: prepare
 		fi
 	done
 	echo "    [OK] Semente saiu em $(LEAVE_AFTER)x e todos os $(PEERS) peers completaram 100% com SHA-256 válido."
+
+demo-picker: prepare
+	@set -euo pipefail
+	echo ""
+	echo "========================================================================"
+	echo " CENÁRIO E: RAREST-FIRST vs SEQUENCIAL (semente sai após $(PICKER_LEAVE)x | $(PEERS) peers | $(REPS) rodadas)"
+	echo "========================================================================"
+	rm -f "$(DEMO_DIR)"/picker-*
+	
+	PIDS=()
+	cleanup() {
+		for pid in "$${PIDS[@]:-}"; do
+			kill "$$pid" 2>/dev/null || true
+		done
+		wait 2>/dev/null || true
+	}
+	trap cleanup EXIT INT TERM
+	
+	for picker in rarest sequential; do
+		for rep in $$(seq 1 "$(REPS)"); do
+			tag="picker-$$picker-$$rep"
+			"$(BIN)" tracker -listen "$(TRACKER_ADDR)" >"$(DEMO_DIR)/$$tag-tracker.log" 2>&1 &
+			PIDS+=("$$!")
+			for _ in $$(seq 1 40); do
+				curl -sf "$(TRACKER_URL)/swarms" >/dev/null 2>&1 && break
+				sleep 0.1
+			done
+	
+			"$(BIN)" seed -id seed -manifest "$(MANIFEST)" -file "$(TEST_FILE)" \
+				-tracker "$(TRACKER_URL)" -up-limit "$(UP_LIMIT)" -leave-after "$(PICKER_LEAVE)" \
+				>"$(DEMO_DIR)/$$tag-seed.log" 2>&1 &
+			SEED_PID=$$!
+			PIDS+=("$$SEED_PID")
+			sleep 1
+	
+			for i in $$(seq 1 "$(PEERS)"); do
+				"$(BIN)" get -id "peer-$$i" -manifest "$(MANIFEST)" \
+					-out "$(DEMO_DIR)/$$tag-$$i.bin" -tracker "$(TRACKER_URL)" \
+					-mode p2p -picker "$$picker" -up-limit "$(UP_LIMIT)" -linger \
+					>"$(DEMO_DIR)/$$tag-$$i.log" 2>&1 &
+				PIDS+=("$$!")
+			done
+	
+			# Espera a semente sair e dá PICKER_WAIT segundos para os peers trocarem o que sobrou.
+			deadline=$$(( $$(date +%s) + $(TIMEOUT_SEC) ))
+			while kill -0 "$$SEED_PID" 2>/dev/null && [ "$$(date +%s)" -lt "$$deadline" ]; do
+				sleep 0.25
+			done
+			sleep "$(PICKER_WAIT)"
+			cleanup
+			PIDS=()
+	
+			# Cada peer grava o bitfield final ao encerrar; a união diz quanto do arquivo sobrou no enxame.
+			sed 's/^|//' <<-'PYEOF' | DEMO_DIR="$(DEMO_DIR)" TAG="$$tag" python3 -
+			|import glob, os, re
+			|d, tag = os.environ["DEMO_DIR"], os.environ["TAG"]
+			|pat = re.compile(r"bitfield final \((\d+)/(\d+) blocos\): ([0-9a-f]+)")
+			|union, total, complete, peers = 0, 1, 0, 0
+			|for log in sorted(glob.glob(os.path.join(d, tag + "-[0-9]*.log"))):
+			|    found = pat.findall(open(log, encoding="utf-8").read())
+			|    if not found:
+			|        continue
+			|    have, total, bits = found[-1]
+			|    total = int(total)
+			|    union |= int(bits, 16)
+			|    complete += int(have) == total
+			|    peers += 1
+			|frac = 100.0 * bin(union).count("1") / total
+			|picker, rep = tag.split("-")[1:]
+			|print(f"    {picker:<10} rodada {rep}: {frac:5.1f}% do arquivo ainda no enxame | {complete}/{peers} peers completos")
+			|with open(os.path.join(d, "picker-resultados.csv"), "a", encoding="utf-8") as f:
+			|    f.write(f"{picker},{rep},{frac:.1f},{complete},{peers}\n")
+			PYEOF
+		done
+	done
+	
+	echo "    Resumo (média, mín-máx da fração do arquivo que sobreviveu à saída da semente):"
+	sed 's/^|//' <<'PYEOF' | DEMO_DIR="$(DEMO_DIR)" python3 -
+	|import os
+	|rows = {}
+	|for line in open(os.path.join(os.environ["DEMO_DIR"], "picker-resultados.csv"), encoding="utf-8"):
+	|    picker, _, frac, _, _ = line.strip().split(",")
+	|    rows.setdefault(picker, []).append(float(frac))
+	|for picker, v in rows.items():
+	|    print(f"      {picker:<10} {sum(v) / len(v):5.1f}%  ({min(v):.1f}-{max(v):.1f}%, {len(v)} rodadas)")
+	PYEOF
 
 demo: compare demo-corrupt demo-leave
 	@echo ""

@@ -87,6 +87,7 @@ func (n *Node) onPiece(c *Conn, i int, data []byte) error {
 	req.writing = true
 	n.inflight[i] = req
 	c.timeouts = 0 // vizinho respondeu com bloco válido
+	c.lastPiece = time.Now()
 	n.mu.Unlock()
 
 	// Grava fora do lock (disco é lento), reaproveitando o SHA-256 já validado acima.
@@ -213,7 +214,15 @@ func (n *Node) reapStaleInflight(now time.Time) {
 	n.mu.Lock()
 	stalledSeen := map[*Conn]bool{}
 	for i, req := range n.inflight {
-		if req.writing || now.Sub(req.requestedAt) <= requestTimeout {
+		age := now.Sub(req.requestedAt)
+		if req.writing || age <= requestTimeout {
+			continue
+		}
+		// Vizinho lento, mas vivo: entregou algum bloco há pouco e atende os
+		// pedidos em ordem, então este também vai chegar. Com o upload dividido
+		// entre muitas conexões, a espera passa de requestTimeout sem nada estar
+		// errado. Só desistimos se o atraso passar de maxRequestWait.
+		if now.Sub(req.conn.lastPiece) <= requestTimeout && age <= maxRequestWait {
 			continue
 		}
 		delete(n.inflight, i)
