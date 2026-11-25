@@ -20,7 +20,8 @@ LEAVE_AFTER  ?= 1.2
 PICKER_LEAVE ?= 1
 PICKER_WAIT  ?= 10
 REPS         ?= 3
-TRACKER_ADDR ?= 127.0.0.1:8000
+HOST_IP		 ?= 127.0.0.1
+TRACKER_ADDR ?= $(HOST_IP):8000
 TRACKER_URL  ?= http://$(TRACKER_ADDR)
 TIMEOUT_SEC  ?= 180
 
@@ -116,7 +117,7 @@ demo-cs: prepare
 		exit 1
 	fi
 
-	"$(BIN)" seed -id seed -manifest "$(MANIFEST)" -file "$(TEST_FILE)" \
+	"$(BIN)" seed -id seed -listen "$(HOST_IP):0" -manifest "$(MANIFEST)" -file "$(TEST_FILE)" \
 		-tracker "$(TRACKER_URL)" -up-limit "$(UP_LIMIT)" >"$(DEMO_DIR)/cs-seed.log" 2>&1 &
 	SEED_PID=$$!
 	PIDS+=("$$SEED_PID")
@@ -124,7 +125,7 @@ demo-cs: prepare
 
 	CLIENT_PIDS=()
 	for i in $$(seq 1 "$(PEERS)"); do
-		"$(BIN)" get -id "cs-$$i" -manifest "$(MANIFEST)" \
+		"$(BIN)" get -id "cs-$$i" -listen "$(HOST_IP):0" -manifest "$(MANIFEST)" \
 			-out "$(DEMO_DIR)/cs-$$i.bin" -tracker "$(TRACKER_URL)" \
 			-mode cs -result "$(DEMO_DIR)/cs-$$i.json" \
 			>"$(DEMO_DIR)/cs-$$i.log" 2>&1 &
@@ -194,7 +195,7 @@ demo-p2p: prepare
 		exit 1
 	fi
 
-	"$(BIN)" seed -id seed -manifest "$(MANIFEST)" -file "$(TEST_FILE)" \
+	"$(BIN)" seed -id seed -listen "$(HOST_IP):0" -manifest "$(MANIFEST)" -file "$(TEST_FILE)" \
 		-tracker "$(TRACKER_URL)" -up-limit "$(UP_LIMIT)" >"$(DEMO_DIR)/p2p-seed.log" 2>&1 &
 	SEED_PID=$$!
 	PIDS+=("$$SEED_PID")
@@ -202,7 +203,7 @@ demo-p2p: prepare
 
 	PEER_PIDS=()
 	for i in $$(seq 1 "$(PEERS)"); do
-		"$(BIN)" get -id "p2p-$$i" -manifest "$(MANIFEST)" \
+		"$(BIN)" get -id "p2p-$$i" -listen "$(HOST_IP):0" -manifest "$(MANIFEST)" \
 			-out "$(DEMO_DIR)/p2p-$$i.bin" -tracker "$(TRACKER_URL)" \
 			-mode p2p -picker rarest -up-limit "$(UP_LIMIT)" -linger -result "$(DEMO_DIR)/p2p-$$i.json" \
 			>"$(DEMO_DIR)/p2p-$$i.log" 2>&1 &
@@ -361,17 +362,17 @@ demo-corrupt: prepare
 	fi
 
 	# Semente legítima com limite de banda e peer malicioso sem limite (garante contato imediato e banimento)
-	"$(BIN)" seed -id seed -manifest "$(MANIFEST)" -file "$(TEST_FILE)" \
+	"$(BIN)" seed -id seed -listen "$(HOST_IP):0" -manifest "$(MANIFEST)" -file "$(TEST_FILE)" \
 		-tracker "$(TRACKER_URL)" -up-limit "$(UP_LIMIT)" >"$(DEMO_DIR)/corrupt-seed.log" 2>&1 &
 	PIDS+=("$$!")
 
-	"$(BIN)" seed -id malicioso -manifest "$(MANIFEST)" -file "$(TEST_FILE)" \
+	"$(BIN)" seed -id malicioso -listen "$(HOST_IP):0" -manifest "$(MANIFEST)" -file "$(TEST_FILE)" \
 		-tracker "$(TRACKER_URL)" -corrupt 1.0 >"$(DEMO_DIR)/corrupt-bad.log" 2>&1 &
 	PIDS+=("$$!")
 	sleep 1
 
 	echo "    Baixando arquivo com 1 semente legítima + 1 semente maliciosa (-corrupt 1.0)..."
-	"$(BIN)" get -id cliente-ok -manifest "$(MANIFEST)" \
+	"$(BIN)" get -id cliente-ok -listen "$(HOST_IP):0" -manifest "$(MANIFEST)" \
 		-out "$(DEMO_DIR)/corrupt-seguro.bin" -tracker "$(TRACKER_URL)" \
 		-result "$(DEMO_DIR)/corrupt-cliente.json" \
 		>"$(DEMO_DIR)/corrupt-cliente.log" 2>&1
@@ -433,7 +434,7 @@ demo-leave: prepare
 		exit 1
 	fi
 
-	"$(BIN)" seed -id seed-temporaria -manifest "$(MANIFEST)" -file "$(TEST_FILE)" \
+	"$(BIN)" seed -id seed-temporaria -listen "$(HOST_IP):0" -manifest "$(MANIFEST)" -file "$(TEST_FILE)" \
 		-tracker "$(TRACKER_URL)" -up-limit "$(UP_LIMIT)" -leave-after "$(LEAVE_AFTER)" \
 		>"$(DEMO_DIR)/leave-seed.log" 2>&1 &
 	SEED_PID=$$!
@@ -445,7 +446,7 @@ demo-leave: prepare
 	# Mesmo sem a semente original, o enxame P2P entrega 100% do arquivo para todos os peers.
 	PEER_PIDS=()
 	echo "    [1/2] peer-1 entrando no enxame enquanto a semente ainda está online..."
-	"$(BIN)" get -id "peer-1" -manifest "$(MANIFEST)" \
+	"$(BIN)" get -id "peer-1" -listen "$(HOST_IP):0" -manifest "$(MANIFEST)" \
 		-out "$(DEMO_DIR)/leave-1.bin" -tracker "$(TRACKER_URL)" \
 		-mode p2p -picker rarest -up-limit "$(UP_LIMIT)" -linger \
 		-result "$(DEMO_DIR)/leave-1.json" \
@@ -465,7 +466,7 @@ demo-leave: prepare
 
 	echo "    [2/2] Peers 2..$(PEERS) entrando; a semente sairá em $(LEAVE_AFTER)x e o enxame completará sem ela..."
 	for i in $$(seq 2 "$(PEERS)"); do
-		"$(BIN)" get -id "peer-$$i" -manifest "$(MANIFEST)" \
+		"$(BIN)" get -id "peer-$$i" -listen "$(HOST_IP):0" -manifest "$(MANIFEST)" \
 			-out "$(DEMO_DIR)/leave-$$i.bin" -tracker "$(TRACKER_URL)" \
 			-mode p2p -picker rarest -up-limit "$(UP_LIMIT)" -linger \
 			-result "$(DEMO_DIR)/leave-$$i.json" \
@@ -561,7 +562,7 @@ demo-picker: prepare
 				sleep 0.1
 			done
 	
-			"$(BIN)" seed -id seed -manifest "$(MANIFEST)" -file "$(TEST_FILE)" \
+			"$(BIN)" seed -id seed -listen "$(HOST_IP):0" -manifest "$(MANIFEST)" -file "$(TEST_FILE)" \
 				-tracker "$(TRACKER_URL)" -up-limit "$(UP_LIMIT)" -leave-after "$(PICKER_LEAVE)" \
 				>"$(DEMO_DIR)/$$tag-seed.log" 2>&1 &
 			SEED_PID=$$!
@@ -569,7 +570,7 @@ demo-picker: prepare
 			sleep 1
 	
 			for i in $$(seq 1 "$(PEERS)"); do
-				"$(BIN)" get -id "peer-$$i" -manifest "$(MANIFEST)" \
+				"$(BIN)" get -id "peer-$$i" -listen "$(HOST_IP):0" -manifest "$(MANIFEST)" \
 					-out "$(DEMO_DIR)/$$tag-$$i.bin" -tracker "$(TRACKER_URL)" \
 					-mode p2p -picker "$$picker" -up-limit "$(UP_LIMIT)" -linger \
 					>"$(DEMO_DIR)/$$tag-$$i.log" 2>&1 &
@@ -620,7 +621,7 @@ demo-picker: prepare
 	|    print(f"      {picker:<10} {sum(v) / len(v):5.1f}%  ({min(v):.1f}-{max(v):.1f}%, {len(v)} rodadas)")
 	PYEOF
 
-demo: compare demo-corrupt demo-leave
+demo: compare demo-corrupt demo-leave demo-picker
 	@echo ""
 	echo "========================================================================"
 	echo " DEMONSTRAÇÃO COMPLETA FINALIZADA COM SUCESSO!"
